@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rolldown_common::ModuleType;
 use rolldown_plugin::{
@@ -13,10 +13,7 @@ use rolldown_plugin::{
 
 use import_map::parse_from_json;
 
-#[derive(Debug, Default)]
-pub struct DenoLoaderPlugin;
-
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "kind")]
 enum ModuleInfo {
   #[serde(rename = "esm")]
@@ -34,7 +31,7 @@ enum ModuleInfo {
   },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 enum DenoMediaType {
   TypeScript,
   Tsx,
@@ -45,7 +42,7 @@ enum DenoMediaType {
   Mjs,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct DenoInfoJsonV1 {
   redirects: HashMap<String, String>,
   modules: Vec<ModuleInfo>,
@@ -81,22 +78,41 @@ fn get_deno_info(specifier: &str) -> Result<DenoInfoJsonV1, &'static str> {
   Ok(serde_json::from_slice(&output.stdout).expect("Failed to parse JSON output"))
 }
 
-pub fn get_local_path(specifier: &str) -> Result<String, &'static str> {
-  let info: DenoInfoJsonV1 = get_deno_info(specifier)?;
+#[derive(Debug, Clone)]
+struct DenoResolveResult {
+  info: DenoInfoJsonV1,
+  local_path: Option<String>,
+  redirected: String,
+}
 
-  // Follow redirects to get the final specifier
-  let final_specifier = follow_redirects(specifier, &info.redirects)?;
-  println!("specifier: {}, final_specifier: {}", specifier, final_specifier);
+#[derive(Debug)]
+pub struct DenoLoaderPlugin {
+  resolve_cache: Mutex<HashMap<String, DenoResolveResult>>,
+}
 
-  // Find module with the final specifier
-  info
-    .modules
-    .into_iter()
-    .find_map(|m| match m {
-      ModuleInfo::Esm { specifier, local, .. } if specifier == final_specifier => Some(local),
+impl Default for DenoLoaderPlugin {
+  fn default() -> Self {
+    Self { resolve_cache: Mutex::new(HashMap::new()) }
+  }
+}
+
+impl DenoLoaderPlugin {
+  fn get_cached_info(&self, specifier: &str) -> Result<DenoResolveResult, &'static str> {
+    if let Some(cached) = self.resolve_cache.lock().unwrap().get(specifier).cloned() {
+      return Ok(cached);
+    }
+
+    let info = get_deno_info(specifier)?;
+    let redirected = follow_redirects(specifier, &info.redirects)?;
+    let local_path = info.modules.iter().find_map(|m| match m {
+      ModuleInfo::Esm { specifier: s, local, .. } if s == &redirected => Some(local.clone()),
       _ => None,
-    })
-    .ok_or_else(|| "Module not found or has no local path")
+    });
+
+    let result = DenoResolveResult { info, local_path, redirected };
+    self.resolve_cache.lock().unwrap().insert(specifier.to_string(), result.clone());
+    Ok(result)
+  }
 }
 
 impl Plugin for DenoLoaderPlugin {
@@ -144,34 +160,20 @@ impl Plugin for DenoLoaderPlugin {
         .map(|url| url.to_string())
         .unwrap_or_else(|| id.to_string());
 
-      println!("specifier: {}, id: {}, maybe_resolved: {}", args.specifier, id, maybe_resolved);
-
       if maybe_resolved.starts_with("jsr:") {
-        let info: DenoInfoJsonV1 = get_deno_info(&maybe_resolved).expect("get info failed");
-        let final_specifier =
-          follow_redirects(&maybe_resolved, &info.redirects).expect("follow_redirects failed");
+        let cached: DenoResolveResult = self.get_cached_info(&maybe_resolved).expect("info failed");
 
         return Ok(Some(HookResolveIdOutput {
-          id: final_specifier,
-          external: Some(false),
-          ..Default::default()
-        }));
-      } else if maybe_resolved.starts_with("http:") || maybe_resolved.starts_with("https:") {
-        return Ok(Some(HookResolveIdOutput {
-          id: maybe_resolved.to_string(),
+          id: cached.redirected,
           external: Some(false),
           ..Default::default()
         }));
       } else if maybe_resolved.starts_with("npm:") {
-        let info: DenoInfoJsonV1 = get_deno_info(&maybe_resolved).expect("get info failed");
-        let redirected =
-          follow_redirects(&maybe_resolved, &info.redirects).expect("follow_redirects failed");
+        let cached: DenoResolveResult = self.get_cached_info(&maybe_resolved).expect("info failed");
 
-        if let Some(ModuleInfo::Npm { npm_package, .. }) = info
-          .modules
-          .into_iter()
-          .find(|m| matches!(m, ModuleInfo::Npm { specifier, .. } if specifier == &redirected))
-        {
+        if let Some(ModuleInfo::Npm { npm_package, .. }) = cached.info.modules.into_iter().find(
+          |m| matches!(m, ModuleInfo::Npm { specifier, .. } if specifier == &cached.redirected),
+        ) {
           let package_name = npm_package.split('@').next().unwrap_or(&npm_package).to_string();
           return Ok(
             ctx
@@ -190,7 +192,14 @@ impl Plugin for DenoLoaderPlugin {
               })?,
           );
         }
+      } else if maybe_resolved.starts_with("http:") || maybe_resolved.starts_with("https:") {
+        return Ok(Some(HookResolveIdOutput {
+          id: maybe_resolved.to_string(),
+          external: Some(false),
+          ..Default::default()
+        }));
       }
+
       Ok(None)
     }
   }
@@ -201,13 +210,12 @@ impl Plugin for DenoLoaderPlugin {
     args: &HookLoadArgs<'_>,
   ) -> impl std::future::Future<Output = HookLoadReturn> + Send {
     async {
-      println!("test {}", args.id);
       if args.id.starts_with("jsr:")
         || args.id.starts_with("http:")
         || args.id.starts_with("https:")
       {
-        let local_path: String = get_local_path(args.id).expect("local path not found");
-        println!("local {}", local_path);
+        let cached = self.get_cached_info(args.id).expect("info failed");
+        let local_path = cached.local_path.expect("local path not found");
         // Return the specifier as the id to tell rolldown that this data url is handled by the plugin. Don't fallback to
         // the default resolve behavior and mark it as external.
         Ok(Some(HookLoadOutput {
