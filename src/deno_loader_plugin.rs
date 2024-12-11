@@ -88,15 +88,20 @@ struct DenoResolveResult {
 #[derive(Debug)]
 pub struct DenoLoaderPlugin {
   resolve_cache: Mutex<HashMap<String, DenoResolveResult>>,
+  pub import_map_string: String,
 }
 
 impl Default for DenoLoaderPlugin {
   fn default() -> Self {
-    Self { resolve_cache: Mutex::new(HashMap::new()) }
+    Self::new(r#"{}"#.to_string())
   }
 }
 
 impl DenoLoaderPlugin {
+  pub fn new(import_map_string: String) -> Self {
+    Self { resolve_cache: Mutex::new(HashMap::new()), import_map_string }
+  }
+
   fn get_cached_info(&self, specifier: &str) -> Result<DenoResolveResult, &'static str> {
     if let Some(cached) = self.resolve_cache.lock().unwrap().get(specifier).cloned() {
       return Ok(cached);
@@ -117,7 +122,7 @@ impl DenoLoaderPlugin {
 
 impl Plugin for DenoLoaderPlugin {
   fn name(&self) -> Cow<'static, str> {
-    "rolldown:data-url".into()
+    Cow::Borrowed("builtin:deno-loader")
   }
 
   fn resolve_id(
@@ -150,9 +155,7 @@ impl Plugin for DenoLoaderPlugin {
         .unwrap_or_else(|| url::Url::parse("file:///").unwrap());
 
       let import_map =
-        parse_from_json(base_url.clone(), r#"{"imports": { "@std/assert": "jsr:@std/assert" }}"#)
-          .unwrap()
-          .import_map;
+        parse_from_json(base_url.clone(), &self.import_map_string).unwrap().import_map;
 
       let maybe_resolved = import_map
         .resolve(&id, &base_url)
